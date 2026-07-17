@@ -402,17 +402,29 @@ fn render_sessions(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_attention(frame: &mut Frame, app: &App, now: DateTime<Utc>, area: Rect) {
     let waiting = app.session.as_ref().and_then(|s| s.waiting_since);
+    // Past the babysit cutoff the session is dormant, not "waiting on you" —
+    // a red alarm about a session that ended days ago is noise.
+    let alarmed = waiting.is_some_and(|since| now - since <= crate::state::babysit_cutoff());
     let mut lines = Vec::new();
-    if let Some(since) = waiting {
-        lines.push(Line::from(Span::styled(
-            format!("⏳ waiting on you — {}", fmt_duration(now - since)),
-            Style::new().fg(RED).add_modifier(Modifier::BOLD),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "● agent working",
-            Style::new().fg(GREEN),
-        )));
+    match waiting {
+        Some(since) if alarmed => {
+            lines.push(Line::from(Span::styled(
+                format!("⏳ waiting on you — {}", fmt_duration(now - since)),
+                Style::new().fg(RED).add_modifier(Modifier::BOLD),
+            )));
+        }
+        Some(since) => {
+            lines.push(Line::from(Span::styled(
+                format!("○ dormant — last active {} ago", fmt_duration(now - since)),
+                Style::new().fg(DIM),
+            )));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "● agent working",
+                Style::new().fg(GREEN),
+            )));
+        }
     }
     if let Some(text) = app
         .session

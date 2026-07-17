@@ -8,6 +8,13 @@ use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 
 use crate::transcript::{self, TranscriptEvent};
 
+/// Waiting gaps longer than this are "you left", not babysitting: they are
+/// excluded from babysit totals, and a session idle past this is dormant
+/// rather than "waiting on you".
+pub(crate) fn babysit_cutoff() -> Duration {
+    Duration::minutes(30)
+}
+
 /// One tool invocation as shown in the live feed.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolRun {
@@ -52,7 +59,10 @@ impl SessionState {
                 // turn is dead — results can't arrive across turns.
                 self.open_tools.clear();
                 if let Some(since) = self.waiting_since.take() {
-                    self.babysit += *at - since;
+                    let gap = *at - since;
+                    if gap <= babysit_cutoff() {
+                        self.babysit += gap;
+                    }
                 }
                 self.prompts += 1;
                 self.last_prompt_at = Some(*at);
@@ -191,9 +201,12 @@ impl History {
                         summary.start = summary.start.min(at);
                         summary.end = summary.end.max(at);
                         if let Some(since) = waiting.take() {
-                            summary.babysit += at - since;
-                            if at.with_timezone(&Local).date_naive() == today {
-                                history.babysit_today += at - since;
+                            let gap = at - since;
+                            if gap <= babysit_cutoff() {
+                                summary.babysit += gap;
+                                if at.with_timezone(&Local).date_naive() == today {
+                                    history.babysit_today += gap;
+                                }
                             }
                         }
                     }
