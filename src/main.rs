@@ -11,6 +11,7 @@ mod state;
 mod transcript;
 mod ui;
 
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -54,6 +55,9 @@ pub(crate) struct App {
     pub(crate) report: Option<ReportData>,
     /// True after a manual session switch: auto-follow is paused until 'a'.
     pub(crate) pinned: bool,
+    /// Session ids hidden from view — transcripts themselves are never touched.
+    hidden: HashSet<String>,
+    hidden_path: PathBuf,
     toast_until: Option<Instant>,
     cwd: PathBuf,
     project_dir: PathBuf,
@@ -65,10 +69,13 @@ fn main() -> Result<()> {
     let (command, cwd) = parse_args()?;
     let project_dir = transcript::project_dir(&cwd)?;
 
+    let hidden_path = hidden_path()?;
+    let hidden = load_hidden(&hidden_path);
+
     match command {
-        Command::Doctor => return doctor(&cwd, &project_dir),
+        Command::Doctor => return doctor(&cwd, &project_dir, &hidden),
         Command::Report | Command::Heatmap | Command::Sessions => {
-            let history = History::scan(&project_dir, Utc::now());
+            let history = History::scan(&project_dir, Utc::now(), &hidden);
             let data = report::build(&cwd, &history)?;
             match command {
                 Command::Report => report::print_report(&data),
@@ -83,7 +90,7 @@ fn main() -> Result<()> {
         bail!("benclaude watch needs a TTY — run it inside a terminal pane");
     }
 
-    let history = History::scan(&project_dir, Utc::now());
+    let history = History::scan(&project_dir, Utc::now(), &hidden);
     // Inline heatmap/sessions blocks want the git join up front; a failure
     // (no repo, no git) just degrades those cells to "—".
     let initial_report = report::build(&cwd, &history).ok();
@@ -95,6 +102,8 @@ fn main() -> Result<()> {
         view: View::Watch,
         report: initial_report,
         pinned: false,
+        hidden,
+        hidden_path,
         toast_until: None,
         cwd,
         project_dir,
@@ -134,6 +143,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                 (View::Watch, KeyCode::Char('q') | KeyCode::Esc) => return Ok(()),
                 (View::Watch, KeyCode::Char('r')) => app.open_report(),
                 (View::Watch, KeyCode::Char('s')) => app.cycle_session(),
+                (View::Watch, KeyCode::Char('x')) => app.hide_current(),
+                (View::Watch, KeyCode::Char('u')) => app.unhide_all(),
                 (View::Watch, KeyCode::Char('a')) => {
                     app.pinned = false;
                     app.show_toast("auto-following the newest session");
@@ -161,7 +172,7 @@ impl App {
                 .is_none_or(|checked| checked.elapsed() >= RESCAN_SESSIONS)
         {
             self.last_session_check = Some(Instant::now());
-            if let Some(latest) = transcript::latest_session(&self.project_dir)
+            if let Some(latest) = self.visible_sessions().into_iter().next()
                 && self.tailer.as_ref().is_none_or(|t| t.path() != latest)
             {
                 self.watch_path(latest);
@@ -195,13 +206,59 @@ impl App {
     /// Manually steps to the next-most-recent session and pins it, so
     /// auto-follow stops fighting the choice (two live sessions otherwise
     /// bounce the view to whichever wrote last).
+    /// All transcripts, newest first, minus hidden ones.
+    fn visible_sessions(&self) -> Vec<PathBuf> {
+        transcript::sessions_by_recency(&self.project_dir)
+            .into_iter()
+            .filter(|path| !self.hidden.contains(&stem(path)))
+            .collect()
+    }
+
+    /// Hides the watched session from benclaude's view (list, stats,
+    /// cycling). The transcript file is NOT touched — undo with 'u'.
+    fn hide_current(&mut self) {
+        let Some(id) = self.session.as_ref().map(|s| s.session_id.clone()) else {
+            return;
+        };
+        self.hidden.insert(id);
+        if let Err(error) = save_hidden(&self.hidden_path, &self.hidden) {
+            self.show_toast(&format!("could not persist hide: {error:#}"));
+            return;
+        }
+        self.session = None;
+        self.tailer = None;
+        self.pinned = false;
+        self.last_session_check = None;
+        self.history = History::scan(&self.project_dir, Utc::now(), &self.hidden);
+        self.report = None;
+        self.show_toast("session hidden from view — press u to restore all");
+    }
+
+    /// Clears every hide and rescans.
+    fn unhide_all(&mut self) {
+        if self.hidden.is_empty() {
+            self.show_toast("nothing hidden");
+            return;
+        }
+        self.hidden.clear();
+        if let Err(error) = save_hidden(&self.hidden_path, &self.hidden) {
+            self.show_toast(&format!("could not persist unhide: {error:#}"));
+            return;
+        }
+        self.last_session_check = None;
+        self.history = History::scan(&self.project_dir, Utc::now(), &self.hidden);
+        self.report = None;
+        self.show_toast("all sessions visible again");
+    }
+
     fn cycle_session(&mut self) {
-        let sessions = transcript::sessions_by_recency(&self.project_dir);
+        let sessions = self.visible_sessions();
         if sessions.len() < 2 {
             self.show_toast("no other session to switch to");
             return;
         }
         let current = self.tailer.as_ref().map(|t| t.path().to_path_buf());
+
         let index = current
             .and_then(|c| sessions.iter().position(|p| *p == c))
             .unwrap_or(0);
@@ -263,9 +320,44 @@ fn parse_args() -> Result<(Command, PathBuf)> {
     Ok((command, project))
 }
 
+fn stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// `~/.config/benclaude/hidden` — one hidden session id per line. Session
+/// ids are UUIDs, so one global file covers every project.
+fn hidden_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".config/benclaude/hidden"))
+}
+
+fn load_hidden(path: &Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_hidden(path: &Path, hidden: &HashSet<String>) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut ids: Vec<&str> = hidden.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    std::fs::write(path, ids.join("\n"))?;
+    Ok(())
+}
+
 /// Non-TUI sanity check: what project dir resolves to, which sessions are
 /// visible, and whether the newest one parses.
-fn doctor(cwd: &Path, project_dir: &Path) -> Result<()> {
+fn doctor(cwd: &Path, project_dir: &Path, hidden: &HashSet<String>) -> Result<()> {
     println!("cwd          {}", cwd.display());
     println!("project dir  {}", project_dir.display());
     println!("exists       {}", project_dir.is_dir());
@@ -275,6 +367,7 @@ fn doctor(cwd: &Path, project_dir: &Path) -> Result<()> {
     }
     let sessions = transcript::recent_sessions(project_dir, 30);
     println!("sessions 30d {}", sessions.len());
+    println!("hidden       {}", hidden.len());
     if let Some(latest) = transcript::latest_session(project_dir) {
         println!("latest       {}", latest.display());
         let mut tailer = Tailer::new(latest);
@@ -295,4 +388,20 @@ fn doctor(cwd: &Path, project_dir: &Path) -> Result<()> {
         println!("latest       none found");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_round_trips() {
+        let path = std::env::temp_dir().join(format!("benclaude-hidden-{}", std::process::id()));
+        let mut set = HashSet::new();
+        set.insert("abc".to_owned());
+        set.insert("def".to_owned());
+        save_hidden(&path, &set).expect("save");
+        assert_eq!(load_hidden(&path), set);
+        std::fs::remove_file(&path).expect("cleanup");
+    }
 }

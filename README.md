@@ -41,7 +41,9 @@ benclaude doctor
 
 The heatmap (files × days edit-intensity grid) and recent sessions live
 directly on the watch pane. Keys: `q` quit · `r` report · `s` switch to
-another session (pins it; `a` resumes auto-following the newest) — inside
+another session (pins it; `a` resumes auto-following the newest) · `x` hide
+the watched session from benclaude's view (`u` restores all; transcripts
+are never deleted — hides live in `~/.config/benclaude/hidden`) — inside
 the report: `b`/`q` back, `r` refresh. The same data is available as
 plain-text subcommands for scripts and agents:
 

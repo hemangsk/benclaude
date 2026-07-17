@@ -455,10 +455,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ("q", "uit  "),
                 ("r", "eport  "),
                 ("s", "witch  "),
+                ("x", " hide  "),
                 ("a", "uto  "),
             ])
         } else {
-            keys_line(&[("q", "uit  "), ("r", "eport  "), ("s", "witch session  ")])
+            keys_line(&[
+                ("q", "uit  "),
+                ("r", "eport  "),
+                ("s", "witch  "),
+                ("x", " hide  "),
+            ])
         }
     } else {
         keys_line(&[("b", "ack  "), ("r", "efresh  ")])

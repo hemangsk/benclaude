@@ -1,7 +1,7 @@
 //! Session state folded from transcript events, plus the 30-day history
 //! aggregates that annotate the live view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
@@ -169,22 +169,26 @@ pub(crate) struct History {
 impl History {
     /// Scans every recent transcript once, at startup. Cheap enough for tens
     /// of megabytes; live data afterwards comes from the tailer only.
-    pub(crate) fn scan(project_dir: &Path, now: DateTime<Utc>) -> Self {
+    pub(crate) fn scan(project_dir: &Path, now: DateTime<Utc>, hidden: &HashSet<String>) -> Self {
         let mut history = Self::default();
         let mut followups_total: u64 = 0;
         let mut tokens_by_day: HashMap<NaiveDate, u64> = HashMap::new();
         let today = now.with_timezone(&Local).date_naive();
 
         for path in transcript::recent_sessions(project_dir, 30) {
+            let id = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if hidden.contains(&id) {
+                continue;
+            }
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
             history.sessions += 1;
             let mut summary = SessionSummary {
-                id: path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                id,
                 start: DateTime::<Utc>::MAX_UTC,
                 end: DateTime::<Utc>::MIN_UTC,
                 prompts: 0,

@@ -1,6 +1,6 @@
 [package]
 name = "benclaude"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Live outcome-analytics side pane for Claude Code sessions"
 license = "MIT"
