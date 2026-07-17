@@ -48,6 +48,9 @@ impl SessionState {
         match event {
             TranscriptEvent::UserPrompt { at } => {
                 self.started.get_or_insert(*at);
+                // A new turn means every still-open tool of the previous
+                // turn is dead — results can't arrive across turns.
+                self.open_tools.clear();
                 if let Some(since) = self.waiting_since.take() {
                     self.babysit += *at - since;
                 }
@@ -103,16 +106,18 @@ impl SessionState {
                 self.turn_output_tokens += output_tokens;
             }
             TranscriptEvent::TurnDone { at } => {
-                if self.open_tools.is_empty() {
-                    self.waiting_since.get_or_insert(*at);
-                }
+                // Unmatched tool results must not block waiting-detection:
+                // the turn is over, so nothing is genuinely running.
+                self.open_tools.clear();
+                self.waiting_since.get_or_insert(*at);
             }
         }
     }
 
-    /// The tool that was called but has not reported a result yet.
+    /// The tool that is genuinely running now: only the newest call counts —
+    /// an older call whose result never matched is stale, not running.
     pub(crate) fn running_tool(&self) -> Option<&ToolRun> {
-        self.tools.iter().rev().find(|t| t.done_at.is_none())
+        self.tools.last().filter(|t| t.done_at.is_none())
     }
 
     /// Most recent finished tools, newest first.
@@ -334,6 +339,39 @@ mod tests {
         assert_eq!(session.babysit, Duration::seconds(60));
         assert_eq!(session.turn_output_tokens, 0);
         assert!(session.files_this_turn.is_empty());
+    }
+
+    #[test]
+    fn stale_unmatched_tool_is_not_running_and_does_not_block_waiting() {
+        let mut session = SessionState::new("s1".into());
+        session.apply(&TranscriptEvent::UserPrompt { at: at(0) });
+        // A tool whose result never arrives (unmatched tool_use_id).
+        session.apply(&TranscriptEvent::ToolCall {
+            at: at(1),
+            id: "lost".into(),
+            name: "Read".into(),
+            label: "app.dart".into(),
+        });
+        // A newer tool that completes normally.
+        session.apply(&TranscriptEvent::ToolCall {
+            at: at(10),
+            id: "ok".into(),
+            name: "Bash".into(),
+            label: "cargo test".into(),
+        });
+        session.apply(&TranscriptEvent::ToolResult {
+            at: at(12),
+            id: "ok".into(),
+        });
+
+        // The stale Read must not resurface as "running".
+        assert!(session.running_tool().is_none());
+        // And it must not appear among finished tools (duration unknown).
+        assert!(session.recent_finished(5).iter().all(|t| t.name == "Bash"));
+
+        // Turn end still detects waiting despite the unmatched open tool.
+        session.apply(&TranscriptEvent::TurnDone { at: at(20) });
+        assert_eq!(session.waiting_since, Some(at(20)));
     }
 
     #[test]
