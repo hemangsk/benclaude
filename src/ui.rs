@@ -299,9 +299,10 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Files × days edit-intensity grid: each row is one hot file, each cell one
-/// local day (block glyph + gap, so empty days still read as grid slots),
-/// brightness scaled against the grid's peak, with a time axis underneath.
+/// Files × days edit grid: each cell one local day showing the edit COUNT
+/// as a digit ('+' for 10+, '·' for none) — digits discriminate where five
+/// similar purples cannot. Colors use absolute thresholds, so a shade means
+/// the same number of edits on every day and every run.
 fn render_heat(frame: &mut Frame, app: &App, area: Rect) {
     let today = Local::now().date_naive();
     let hottest = app.history.hottest_files(HEAT_FILES);
@@ -309,13 +310,6 @@ fn render_heat(frame: &mut Frame, app: &App, area: Rect) {
     let label_width = usize::from(area.width.saturating_sub(2))
         .saturating_sub(cells * 2 + 1)
         .max(8);
-
-    let peak = hottest
-        .iter()
-        .filter_map(|(file, _)| app.history.edits_by_file_day.get(*file))
-        .flat_map(|days| days.values().copied())
-        .max()
-        .unwrap_or(0);
 
     let mut lines = Vec::new();
     for (file, _) in &hottest {
@@ -327,7 +321,7 @@ fn render_heat(frame: &mut Frame, app: &App, area: Rect) {
         for days_ago in (0..HEAT_DAYS).rev() {
             let day = today - Duration::days(days_ago);
             let edits = days.and_then(|d| d.get(&day)).copied().unwrap_or(0);
-            spans.push(Span::styled("█ ", Style::new().fg(heat_color(edits, peak))));
+            spans.push(heat_cell(edits));
         }
         lines.push(Line::from(spans));
     }
@@ -564,13 +558,27 @@ fn two_columns(width: u16, left: Vec<Span<'static>>, right: Vec<Span<'static>>) 
     Line::from(spans)
 }
 
-fn heat_color(edits: u64, peak: u64) -> Color {
-    if edits == 0 || peak == 0 {
-        return HEAT[0];
-    }
-    let last = HEAT.len() - 1;
-    let bucket = (edits * last as u64).div_ceil(peak);
-    HEAT[usize::try_from(bucket).unwrap_or(last).clamp(1, last)]
+/// One day cell: the edit count as a digit, colored by fixed thresholds
+/// (1 / 2–3 / 4–6 / 7+), `·` for an empty day.
+fn heat_cell(edits: u64) -> Span<'static> {
+    let (glyph, color) = match edits {
+        0 => ('·', FAINT),
+        1 => ('1', HEAT[1]),
+        2..=3 => (
+            char::from_digit(u32::try_from(edits).unwrap_or(2), 10).unwrap_or('2'),
+            HEAT[2],
+        ),
+        4..=6 => (
+            char::from_digit(u32::try_from(edits).unwrap_or(4), 10).unwrap_or('4'),
+            HEAT[3],
+        ),
+        7..=9 => (
+            char::from_digit(u32::try_from(edits).unwrap_or(7), 10).unwrap_or('7'),
+            HEAT[4],
+        ),
+        _ => ('+', HEAT[4]),
+    };
+    Span::styled(format!("{glyph} "), Style::new().fg(color).bold())
 }
 
 fn spark_char(value: u64, peak: u64) -> char {
