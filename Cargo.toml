@@ -1,0 +1,23 @@
+[package]
+name = "benclaude"
+version = "0.1.0"
+edition = "2024"
+description = "Live outcome-analytics side pane for Claude Code sessions"
+license = "MIT"
+repository = "https://github.com/hemangsk/benclaude"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ratatui = "0.29"
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Field/variant names like `transcript::TranscriptEvent` are deliberate.
+module_name_repetitions = "allow"
