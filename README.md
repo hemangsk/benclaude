@@ -40,9 +40,10 @@ benclaude doctor
 ```
 
 The heatmap (files × days edit-intensity grid) and recent sessions live
-directly on the watch pane. Keys: `q` quit · `r` report (inside the report:
-`b`/`q` back, `r` refresh). The same data is available as plain-text
-subcommands for scripts and agents:
+directly on the watch pane. Keys: `q` quit · `r` report · `s` switch to
+another session (pins it; `a` resumes auto-following the newest) — inside
+the report: `b`/`q` back, `r` refresh. The same data is available as
+plain-text subcommands for scripts and agents:
 
 ```sh
 benclaude report     # AI commits, line survival 7d+, tokens per surviving line

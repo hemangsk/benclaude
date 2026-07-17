@@ -52,6 +52,8 @@ pub(crate) struct App {
     pub(crate) toast: Option<String>,
     pub(crate) view: View,
     pub(crate) report: Option<ReportData>,
+    /// True after a manual session switch: auto-follow is paused until 'a'.
+    pub(crate) pinned: bool,
     toast_until: Option<Instant>,
     cwd: PathBuf,
     project_dir: PathBuf,
@@ -92,6 +94,7 @@ fn main() -> Result<()> {
         toast: None,
         view: View::Watch,
         report: initial_report,
+        pinned: false,
         toast_until: None,
         cwd,
         project_dir,
@@ -130,6 +133,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             match (app.view, key.code) {
                 (View::Watch, KeyCode::Char('q') | KeyCode::Esc) => return Ok(()),
                 (View::Watch, KeyCode::Char('r')) => app.open_report(),
+                (View::Watch, KeyCode::Char('s')) => app.cycle_session(),
+                (View::Watch, KeyCode::Char('a')) => {
+                    app.pinned = false;
+                    app.show_toast("auto-following the newest session");
+                }
                 (View::Report, KeyCode::Char('q' | 'b') | KeyCode::Esc) => {
                     app.view = View::Watch;
                 }
@@ -147,20 +155,16 @@ impl App {
     /// Picks up new transcript lines, switches to a newer session when one
     /// appears, and expires the toast.
     fn refresh(&mut self) -> Result<()> {
-        if self
-            .last_session_check
-            .is_none_or(|checked| checked.elapsed() >= RESCAN_SESSIONS)
+        if !self.pinned
+            && self
+                .last_session_check
+                .is_none_or(|checked| checked.elapsed() >= RESCAN_SESSIONS)
         {
             self.last_session_check = Some(Instant::now());
             if let Some(latest) = transcript::latest_session(&self.project_dir)
                 && self.tailer.as_ref().is_none_or(|t| t.path() != latest)
             {
-                let id = latest
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.session = Some(SessionState::new(id));
-                self.tailer = Some(Tailer::new(latest));
+                self.watch_path(latest);
             }
         }
         if let (Some(tailer), Some(session)) = (&mut self.tailer, &mut self.session) {
@@ -176,6 +180,34 @@ impl App {
             self.toast_until = None;
         }
         Ok(())
+    }
+
+    /// Starts (or restarts) watching one transcript from the top.
+    fn watch_path(&mut self, path: PathBuf) {
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.session = Some(SessionState::new(id));
+        self.tailer = Some(Tailer::new(path));
+    }
+
+    /// Manually steps to the next-most-recent session and pins it, so
+    /// auto-follow stops fighting the choice (two live sessions otherwise
+    /// bounce the view to whichever wrote last).
+    fn cycle_session(&mut self) {
+        let sessions = transcript::sessions_by_recency(&self.project_dir);
+        if sessions.len() < 2 {
+            self.show_toast("no other session to switch to");
+            return;
+        }
+        let current = self.tailer.as_ref().map(|t| t.path().to_path_buf());
+        let index = current
+            .and_then(|c| sessions.iter().position(|p| *p == c))
+            .unwrap_or(0);
+        let next = sessions[(index + 1) % sessions.len()].clone();
+        self.watch_path(next);
+        self.pinned = true;
     }
 
     /// Switches to the report view, running the git join if needed.

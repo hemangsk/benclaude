@@ -98,10 +98,16 @@ fn render_header(frame: &mut Frame, app: &App, header: Rect, sub: Rect) {
         )),
         header,
     );
-    let (status_dot, status) = if app.session.is_some() {
-        (Span::styled("● ", Style::new().fg(GREEN)), "live")
+    let (status_dot, status, status_color) = if app.session.is_none() {
+        (Span::styled("○ ", Style::new().fg(DIM)), "no session", DIM)
+    } else if app.pinned {
+        (
+            Span::styled("◉ ", Style::new().fg(YELLOW)),
+            "pinned",
+            YELLOW,
+        )
     } else {
-        (Span::styled("○ ", Style::new().fg(DIM)), "no session")
+        (Span::styled("● ", Style::new().fg(GREEN)), "live", GREEN)
     };
     let started = app
         .session
@@ -116,7 +122,7 @@ fn render_header(frame: &mut Frame, app: &App, header: Rect, sub: Rect) {
                 Style::new().fg(DIM),
             ),
             status_dot,
-            Span::styled(status, Style::new().fg(GREEN)),
+            Span::styled(status, Style::new().fg(status_color)),
         ])),
         sub,
     );
@@ -432,7 +438,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let line = if let Some(toast) = &app.toast {
         Line::styled(toast.clone(), Style::new().fg(YELLOW))
     } else if app.view == View::Watch {
-        keys_line(&[("q", "uit  "), ("r", "eport  ")])
+        if app.pinned {
+            keys_line(&[
+                ("q", "uit  "),
+                ("r", "eport  "),
+                ("s", "witch  "),
+                ("a", "uto  "),
+            ])
+        } else {
+            keys_line(&[("q", "uit  "), ("r", "eport  "), ("s", "witch session  ")])
+        }
     } else {
         keys_line(&[("b", "ack  "), ("r", "efresh  ")])
     };

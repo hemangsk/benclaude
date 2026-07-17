@@ -63,23 +63,29 @@ pub(crate) fn sanitize(path: &Path) -> String {
         .collect()
 }
 
+/// All `*.jsonl` transcripts in `dir`, newest-modified first.
+pub(crate) fn sessions_by_recency(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "jsonl") {
+                return None;
+            }
+            let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    sessions.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    sessions.into_iter().map(|(_, path)| path).collect()
+}
+
 /// The most recently modified `*.jsonl` transcript in `dir`, if any.
 pub(crate) fn latest_session(dir: &Path) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "jsonl") {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
-            best = Some((modified, path));
-        }
-    }
-    best.map(|(_, path)| path)
+    sessions_by_recency(dir).into_iter().next()
 }
 
 /// All `*.jsonl` transcripts in `dir` modified within the last `days` days.
