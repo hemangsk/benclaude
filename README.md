@@ -39,9 +39,10 @@ benclaude watch --project ~/code/my-app
 benclaude doctor
 ```
 
-Keys in `watch`: `q` quit · `r` report · `h` heatmap · `s` sessions
-(inside a view: `b`/`q` back, `r` refresh). The same views are available as
-plain-text subcommands for scripts and agents:
+The heatmap (files × days edit-intensity grid) and recent sessions live
+directly on the watch pane. Keys: `q` quit · `r` report (inside the report:
+`b`/`q` back, `r` refresh). The same data is available as plain-text
+subcommands for scripts and agents:
 
 ```sh
 benclaude report     # AI commits, line survival 7d+, tokens per surviving line

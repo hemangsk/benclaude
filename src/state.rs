@@ -144,6 +144,8 @@ pub(crate) struct History {
     pub(crate) tokens_by_day: Vec<(NaiveDate, u64)>,
     pub(crate) edits_per_file: HashMap<String, u64>,
     pub(crate) sessions_per_file: HashMap<String, u64>,
+    /// Edit counts per file per local day — the heatmap grid.
+    pub(crate) edits_by_file_day: HashMap<String, HashMap<NaiveDate, u64>>,
     pub(crate) followups_avg: f64,
     pub(crate) babysit_today: Duration,
     pub(crate) summaries: Vec<SessionSummary>,
@@ -201,6 +203,12 @@ impl History {
                         summary.end = summary.end.max(at);
                         if transcript::is_file_edit(&name) && !label.is_empty() {
                             *history.edits_per_file.entry(label.clone()).or_insert(0) += 1;
+                            *history
+                                .edits_by_file_day
+                                .entry(label.clone())
+                                .or_default()
+                                .entry(at.with_timezone(&Local).date_naive())
+                                .or_insert(0) += 1;
                             session_files.insert(label);
                         }
                     }
@@ -242,11 +250,16 @@ impl History {
         history
     }
 
-    pub(crate) fn most_edited(&self) -> Option<(&str, u64)> {
-        self.edits_per_file
+    /// The most-edited files, descending — the heatmap rows.
+    pub(crate) fn hottest_files(&self, count: usize) -> Vec<(&str, u64)> {
+        let mut files: Vec<(&str, u64)> = self
+            .edits_per_file
             .iter()
-            .max_by_key(|(name, count)| (**count, std::cmp::Reverse(name.as_str())))
-            .map(|(name, count)| (name.as_str(), *count))
+            .map(|(name, edits)| (name.as_str(), *edits))
+            .collect();
+        files.sort_by_key(|(name, edits)| (std::cmp::Reverse(*edits), *name));
+        files.truncate(count);
+        files
     }
 
     /// Historical churn for a file shown in FILES THIS TURN.

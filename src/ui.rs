@@ -1,7 +1,8 @@
-//! The ratatui view: a narrow side-pane layout mirroring the benclaude
-//! mockup — header, LIVE TURN, FILES THIS TURN, SESSION, HISTORY, ATTENTION.
+//! The ratatui view: a narrow side-pane layout — header, LIVE TURN, FILES
+//! THIS TURN, SESSION, HISTORY, HEATMAP (files × days intensity grid),
+//! SESSIONS, ATTENTION — plus the full-screen REPORT view.
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -24,12 +25,22 @@ const BORDER_ALERT: Color = Color::Rgb(0x5c, 0x3a, 0x41);
 
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
+/// Cold-to-hot ramp for the heatmap cells (background colors).
+const HEAT: [Color; 5] = [
+    Color::Rgb(0x14, 0x18, 0x21),
+    Color::Rgb(0x3a, 0x2b, 0x5e),
+    Color::Rgb(0x6f, 0x4b, 0xa8),
+    Color::Rgb(0xb5, 0x8f, 0xf2),
+    Color::Rgb(0xe0, 0x6c, 0x75),
+];
+/// Days shown per heatmap row; each cell is two characters wide.
+const HEAT_DAYS: i64 = 14;
+const HEAT_FILES: usize = 4;
+
 pub(crate) fn render(frame: &mut Frame, app: &App) {
     match app.view {
         View::Watch => render_watch(frame, app),
-        View::Report => render_table_view(frame, app, "REPORT · 30D", report_lines(app)),
-        View::Heatmap => render_table_view(frame, app, "HEATMAP · 30D", heatmap_lines(app)),
-        View::Sessions => render_table_view(frame, app, "SESSIONS · 30D", session_lines(app)),
+        View::Report => render_report_view(frame, app),
     }
 }
 
@@ -42,6 +53,8 @@ fn render_watch(frame: &mut Frame, app: &App) {
         files,
         session,
         history,
+        heat,
+        sessions,
         attention,
         _rest,
         footer,
@@ -51,7 +64,9 @@ fn render_watch(frame: &mut Frame, app: &App) {
         Constraint::Length(8),
         Constraint::Length(5),
         Constraint::Length(6),
+        Constraint::Length(5),
         Constraint::Length(6),
+        Constraint::Length(4),
         Constraint::Length(4),
         Constraint::Min(0),
         Constraint::Length(1),
@@ -63,6 +78,8 @@ fn render_watch(frame: &mut Frame, app: &App) {
     render_files(frame, app, files);
     render_session(frame, app, session);
     render_history(frame, app, history);
+    render_heat(frame, app, heat);
+    render_sessions(frame, app, sessions);
     render_attention(frame, app, now, attention);
     render_footer(frame, app, footer);
 }
@@ -266,16 +283,6 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(spark, Style::new().fg(PURPLE)),
         Span::styled("  tok/day · 8d", Style::new().fg(DIM)),
     ]));
-    if let Some((file, count)) = history.most_edited() {
-        lines.push(kv_row(
-            width,
-            "most edited",
-            vec![
-                Span::styled(truncate(file, 20), Style::new().fg(FG)),
-                Span::styled(format!(" ×{count}"), Style::new().fg(YELLOW)),
-            ],
-        ));
-    }
     lines.push(kv_row(
         width,
         "follow-ups/session",
@@ -288,6 +295,98 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(block("HISTORY · 30D", false)),
         area,
     );
+}
+
+/// Files × days edit-intensity grid: each row is one hot file, each
+/// two-character cell one local day, background color scaled cold→hot
+/// against the grid's peak.
+fn render_heat(frame: &mut Frame, app: &App, area: Rect) {
+    let today = Local::now().date_naive();
+    let hottest = app.history.hottest_files(HEAT_FILES);
+    let cells = usize::try_from(HEAT_DAYS).unwrap_or(0);
+    let label_width = usize::from(area.width.saturating_sub(2))
+        .saturating_sub(cells * 2 + 1)
+        .max(8);
+
+    let peak = hottest
+        .iter()
+        .filter_map(|(file, _)| app.history.edits_by_file_day.get(*file))
+        .flat_map(|days| days.values().copied())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines = Vec::new();
+    for (file, _) in &hottest {
+        let days = app.history.edits_by_file_day.get(*file);
+        let mut spans = vec![Span::styled(
+            format!("{:<label_width$} ", truncate(file, label_width)),
+            Style::new().fg(FG),
+        )];
+        for days_ago in (0..HEAT_DAYS).rev() {
+            let day = today - Duration::days(days_ago);
+            let edits = days.and_then(|d| d.get(&day)).copied().unwrap_or(0);
+            spans.push(Span::styled("  ", Style::new().bg(heat_color(edits, peak))));
+        }
+        lines.push(Line::from(spans));
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled("no edits in 30 days", Style::new().fg(DIM)));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(block("HEATMAP · EDITS × 14D", false)),
+        area,
+    );
+}
+
+/// The most recent sessions with their linked-commit count from the report.
+fn render_sessions(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(2);
+    let mut lines = Vec::new();
+    for summary in app.history.summaries.iter().rev().take(2) {
+        let commits = app.report.as_ref().map(|data| {
+            data.sessions
+                .iter()
+                .find(|row| row.id == summary.id)
+                .map_or(0, |row| row.commits)
+        });
+        let mut right = vec![Span::styled(
+            format!(
+                "{}t  {}",
+                summary.prompts,
+                fmt_tokens(summary.output_tokens)
+            ),
+            Style::new().fg(FG),
+        )];
+        match commits {
+            Some(count) => right.push(Span::styled(
+                format!("  ⚑{count}"),
+                Style::new().fg(if count > 0 { GREEN } else { DIM }),
+            )),
+            None => right.push(Span::styled("  ⚑—", Style::new().fg(FAINT))),
+        }
+        lines.push(two_columns(
+            width,
+            vec![
+                Span::styled(
+                    format!("{} ", short_id(&summary.id)),
+                    Style::new().fg(PURPLE),
+                ),
+                Span::styled(
+                    summary
+                        .start
+                        .with_timezone(&Local)
+                        .format("%m-%d %H:%M")
+                        .to_string(),
+                    Style::new().fg(FAINT),
+                ),
+            ],
+            right,
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled("no sessions yet", Style::new().fg(DIM)));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block("SESSIONS", false)), area);
 }
 
 fn render_attention(frame: &mut Frame, app: &App, now: DateTime<Utc>, area: Rect) {
@@ -328,14 +427,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let line = if let Some(toast) = &app.toast {
         Line::styled(toast.clone(), Style::new().fg(YELLOW))
     } else if app.view == View::Watch {
-        keys_line(&[
-            ("q", "uit  "),
-            ("r", "eport  "),
-            ("h", "eatmap  "),
-            ("s", "essions  "),
-        ])
+        keys_line(&[("q", "uit  "), ("r", "eport  ")])
     } else {
-        keys_line(&[("b", "ack  "), ("r", "efresh  "), ("q", " to watch  ")])
+        keys_line(&[("b", "ack  "), ("r", "efresh  ")])
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -350,12 +444,15 @@ fn keys_line(keys: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-// ---- full-screen analytics views -------------------------------------------
+// ---- full-screen report view ------------------------------------------------
 
-fn render_table_view(frame: &mut Frame, app: &App, title: &str, lines: Vec<Line<'static>>) {
+fn render_report_view(frame: &mut Frame, app: &App) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
-    frame.render_widget(Paragraph::new(lines).block(block(title, false)), body);
+    frame.render_widget(
+        Paragraph::new(report_lines(app)).block(block("REPORT · 30D", false)),
+        body,
+    );
     render_footer(frame, app, footer);
 }
 
@@ -413,82 +510,14 @@ fn report_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-fn heatmap_lines(app: &App) -> Vec<Line<'static>> {
-    let Some(data) = &app.report else {
-        return vec![Line::styled("no data — press r", Style::new().fg(DIM))];
-    };
-    let mut lines = vec![Line::styled(
-        format!(
-            "{:<22} {:>5} {:>4} {:>6} {:>6}",
-            "file", "edits", "sess", "added", "alive"
-        ),
-        Style::new().fg(DIM),
-    )];
-    for row in data.heat.iter().take(15) {
-        let hot = row.edits >= 4;
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<22}", truncate(&row.file, 22)),
-                Style::new().fg(if hot { YELLOW } else { FG }),
-            ),
-            Span::styled(
-                format!(" {:>5} {:>4}", row.edits, row.sessions),
-                Style::new().fg(FG),
-            ),
-            Span::styled(
-                format!(" {:>6} {:>6}", row.added, row.surviving),
-                Style::new().fg(DIM),
-            ),
-        ]));
-    }
-    lines
-}
-
-fn session_lines(app: &App) -> Vec<Line<'static>> {
-    let Some(data) = &app.report else {
-        return vec![Line::styled("no data — press r", Style::new().fg(DIM))];
-    };
-    let mut lines = vec![Line::styled(
-        format!(
-            "{:<9} {:<11} {:>5} {:>7} {:>7} {:>4}",
-            "session", "start", "turns", "tok", "babysit", "cmts"
-        ),
-        Style::new().fg(DIM),
-    )];
-    for row in data.sessions.iter().take(15) {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:<9}", short_id(&row.id)), Style::new().fg(PURPLE)),
-            Span::styled(
-                format!(
-                    " {:<11}",
-                    row.start.with_timezone(&Local).format("%m-%d %H:%M")
-                ),
-                Style::new().fg(FAINT),
-            ),
-            Span::styled(
-                format!(
-                    " {:>5} {:>7} {:>7}",
-                    row.prompts,
-                    fmt_tokens(row.output_tokens),
-                    fmt_duration(row.babysit)
-                ),
-                Style::new().fg(FG),
-            ),
-            Span::styled(
-                format!(" {:>4}", row.commits),
-                Style::new().fg(if row.commits > 0 { GREEN } else { DIM }),
-            ),
-        ]));
-    }
-    lines
-}
-
 fn kv_line(label: &str, value: String, color: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:<19}"), Style::new().fg(DIM)),
         Span::styled(value, Style::new().fg(color)),
     ])
 }
+
+// ---- helpers ----------------------------------------------------------------
 
 fn block(title: &str, alert: bool) -> Block<'_> {
     let (border, title_color) = if alert {
@@ -522,6 +551,15 @@ fn two_columns(width: u16, left: Vec<Span<'static>>, right: Vec<Span<'static>>) 
     spans.push(Span::raw(" ".repeat(pad)));
     spans.extend(right);
     Line::from(spans)
+}
+
+fn heat_color(edits: u64, peak: u64) -> Color {
+    if edits == 0 || peak == 0 {
+        return HEAT[0];
+    }
+    let last = HEAT.len() - 1;
+    let bucket = (edits * last as u64).div_ceil(peak);
+    HEAT[usize::try_from(bucket).unwrap_or(last).clamp(1, last)]
 }
 
 fn spark_char(value: u64, peak: u64) -> char {

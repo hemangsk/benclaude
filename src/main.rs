@@ -41,8 +41,6 @@ enum Command {
 pub(crate) enum View {
     Watch,
     Report,
-    Heatmap,
-    Sessions,
 }
 
 /// Shared app state handed to the renderer.
@@ -83,13 +81,17 @@ fn main() -> Result<()> {
         bail!("benclaude watch needs a TTY — run it inside a terminal pane");
     }
 
+    let history = History::scan(&project_dir, Utc::now());
+    // Inline heatmap/sessions blocks want the git join up front; a failure
+    // (no repo, no git) just degrades those cells to "—".
+    let initial_report = report::build(&cwd, &history).ok();
     let mut app = App {
         project_name: project_name(&cwd),
         session: None,
-        history: History::scan(&project_dir, Utc::now()),
+        history,
         toast: None,
         view: View::Watch,
-        report: None,
+        report: initial_report,
         toast_until: None,
         cwd,
         project_dir,
@@ -127,13 +129,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             }
             match (app.view, key.code) {
                 (View::Watch, KeyCode::Char('q') | KeyCode::Esc) => return Ok(()),
-                (View::Watch, KeyCode::Char('r')) => app.open(View::Report),
-                (View::Watch, KeyCode::Char('h')) => app.open(View::Heatmap),
-                (View::Watch, KeyCode::Char('s')) => app.open(View::Sessions),
-                (_, KeyCode::Char('q' | 'b') | KeyCode::Esc) => app.view = View::Watch,
-                (view, KeyCode::Char('r')) => {
+                (View::Watch, KeyCode::Char('r')) => app.open_report(),
+                (View::Report, KeyCode::Char('q' | 'b') | KeyCode::Esc) => {
+                    app.view = View::Watch;
+                }
+                (View::Report, KeyCode::Char('r')) => {
                     app.report = None;
-                    app.open(view);
+                    app.open_report();
                 }
                 _ => {}
             }
@@ -176,8 +178,8 @@ impl App {
         Ok(())
     }
 
-    /// Switches to an analytics view, running the git join if needed.
-    fn open(&mut self, view: View) {
+    /// Switches to the report view, running the git join if needed.
+    fn open_report(&mut self) {
         if self.report.is_none() {
             match report::build(&self.cwd, &self.history) {
                 Ok(data) => self.report = Some(data),
@@ -187,7 +189,7 @@ impl App {
                 }
             }
         }
-        self.view = view;
+        self.view = View::Report;
     }
 
     fn show_toast(&mut self, message: &str) {
