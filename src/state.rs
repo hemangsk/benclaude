@@ -126,14 +126,27 @@ impl SessionState {
     }
 }
 
+/// A digest of one past session, used to join sessions to git commits.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionSummary {
+    pub(crate) id: String,
+    pub(crate) start: DateTime<Utc>,
+    pub(crate) end: DateTime<Utc>,
+    pub(crate) prompts: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) babysit: Duration,
+}
+
 /// Aggregates over the last 30 days of transcripts in the project directory.
 #[derive(Debug, Default)]
 pub(crate) struct History {
     pub(crate) sessions: u64,
     pub(crate) tokens_by_day: Vec<(NaiveDate, u64)>,
     pub(crate) edits_per_file: HashMap<String, u64>,
+    pub(crate) sessions_per_file: HashMap<String, u64>,
     pub(crate) followups_avg: f64,
     pub(crate) babysit_today: Duration,
+    pub(crate) summaries: Vec<SessionSummary>,
 }
 
 impl History {
@@ -150,38 +163,67 @@ impl History {
                 continue;
             };
             history.sessions += 1;
-            let mut prompts: u64 = 0;
+            let mut summary = SessionSummary {
+                id: path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                start: DateTime::<Utc>::MAX_UTC,
+                end: DateTime::<Utc>::MIN_UTC,
+                prompts: 0,
+                output_tokens: 0,
+                babysit: Duration::zero(),
+            };
+            let mut session_files: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut waiting: Option<DateTime<Utc>> = None;
             for event in text.lines().flat_map(transcript::parse_line) {
                 match event {
                     TranscriptEvent::UserPrompt { at } => {
-                        prompts += 1;
-                        if let Some(since) = waiting.take()
-                            && at.with_timezone(&Local).date_naive() == today
-                        {
-                            history.babysit_today += at - since;
+                        summary.prompts += 1;
+                        summary.start = summary.start.min(at);
+                        summary.end = summary.end.max(at);
+                        if let Some(since) = waiting.take() {
+                            summary.babysit += at - since;
+                            if at.with_timezone(&Local).date_naive() == today {
+                                history.babysit_today += at - since;
+                            }
                         }
                     }
                     TranscriptEvent::TurnDone { at } => {
+                        summary.end = summary.end.max(at);
                         waiting = Some(at);
                     }
-                    TranscriptEvent::ToolCall { name, label, .. } => {
+                    TranscriptEvent::ToolCall {
+                        at, name, label, ..
+                    } => {
                         waiting = None;
+                        summary.end = summary.end.max(at);
                         if transcript::is_file_edit(&name) && !label.is_empty() {
-                            *history.edits_per_file.entry(label).or_insert(0) += 1;
+                            *history.edits_per_file.entry(label.clone()).or_insert(0) += 1;
+                            session_files.insert(label);
                         }
                     }
                     TranscriptEvent::Usage {
                         at, output_tokens, ..
                     } => {
+                        summary.output_tokens += output_tokens;
+                        summary.end = summary.end.max(at);
                         let day = at.with_timezone(&Local).date_naive();
                         *tokens_by_day.entry(day).or_insert(0) += output_tokens;
                     }
                     _ => {}
                 }
             }
-            followups_total += prompts.saturating_sub(1);
+            followups_total += summary.prompts.saturating_sub(1);
+            for file in session_files {
+                *history.sessions_per_file.entry(file).or_insert(0) += 1;
+            }
+            if summary.prompts > 0 {
+                history.summaries.push(summary);
+            }
         }
+        history.summaries.sort_by_key(|s| s.start);
 
         // Last 8 calendar days, oldest first, for the sparkline.
         history.tokens_by_day = (0..8)

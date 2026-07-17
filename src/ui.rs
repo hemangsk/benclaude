@@ -8,8 +8,8 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 
-use crate::App;
 use crate::state::{fmt_duration, fmt_tokens};
+use crate::{App, View};
 
 const PURPLE: Color = Color::Rgb(0xb5, 0x8f, 0xf2);
 const CYAN: Color = Color::Rgb(0x56, 0xc9, 0xdf);
@@ -25,6 +25,15 @@ const BORDER_ALERT: Color = Color::Rgb(0x5c, 0x3a, 0x41);
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 pub(crate) fn render(frame: &mut Frame, app: &App) {
+    match app.view {
+        View::Watch => render_watch(frame, app),
+        View::Report => render_table_view(frame, app, "REPORT · 30D", report_lines(app)),
+        View::Heatmap => render_table_view(frame, app, "HEATMAP · 30D", heatmap_lines(app)),
+        View::Sessions => render_table_view(frame, app, "SESSIONS · 30D", session_lines(app)),
+    }
+}
+
+fn render_watch(frame: &mut Frame, app: &App) {
     let now = Utc::now();
     let [
         header,
@@ -318,20 +327,167 @@ fn render_attention(frame: &mut Frame, app: &App, now: DateTime<Utc>, area: Rect
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let line = if let Some(toast) = &app.toast {
         Line::styled(toast.clone(), Style::new().fg(YELLOW))
-    } else {
-        Line::from(vec![
-            Span::styled("[q]", Style::new().fg(FAINT)),
-            Span::styled("uit  ", Style::new().fg(DIM)),
-            Span::styled("[r]", Style::new().fg(FAINT)),
-            Span::styled("eport  ", Style::new().fg(DIM)),
-            Span::styled("[h]", Style::new().fg(FAINT)),
-            Span::styled("eatmap  ", Style::new().fg(DIM)),
-            Span::styled("[s]", Style::new().fg(FAINT)),
-            Span::styled("essions  ", Style::new().fg(DIM)),
-            Span::styled("· ro-mode", Style::new().fg(FAINT)),
+    } else if app.view == View::Watch {
+        keys_line(&[
+            ("q", "uit  "),
+            ("r", "eport  "),
+            ("h", "eatmap  "),
+            ("s", "essions  "),
         ])
+    } else {
+        keys_line(&[("b", "ack  "), ("r", "efresh  "), ("q", " to watch  ")])
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn keys_line(keys: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (key, rest) in keys {
+        spans.push(Span::styled(format!("[{key}]"), Style::new().fg(FAINT)));
+        spans.push(Span::styled((*rest).to_owned(), Style::new().fg(DIM)));
+    }
+    spans.push(Span::styled("· ro-mode", Style::new().fg(FAINT)));
+    Line::from(spans)
+}
+
+// ---- full-screen analytics views -------------------------------------------
+
+fn render_table_view(frame: &mut Frame, app: &App, title: &str, lines: Vec<Line<'static>>) {
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+    frame.render_widget(Paragraph::new(lines).block(block(title, false)), body);
+    render_footer(frame, app, footer);
+}
+
+fn report_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(data) = &app.report else {
+        return vec![Line::styled("no data — press r", Style::new().fg(DIM))];
+    };
+    let mut lines = Vec::new();
+    lines.push(kv_line("AI commits", data.commits.len().to_string(), GREEN));
+    let added: u64 = data.commits.iter().map(|c| c.added).sum();
+    lines.push(kv_line("lines added", added.to_string(), FG));
+    match data.survival_pct() {
+        Some(pct) => lines.push(kv_line(
+            "line survival 7d+",
+            format!(
+                "{pct:.0}%  ({}/{} mature)",
+                data.surviving_mature, data.added_mature
+            ),
+            if pct >= 80.0 { GREEN } else { YELLOW },
+        )),
+        None => lines.push(kv_line("line survival 7d+", "— (<7d old)".to_owned(), DIM)),
+    }
+    if let Some(cost) = data.tokens_per_surviving_line() {
+        lines.push(kv_line("tok/surviving line", format!("{cost:.0}"), FG));
+    }
+    lines.push(Line::raw(""));
+    for row in data.commits.iter().take(12) {
+        let age = if row.mature { "" } else { " <7d" };
+        lines.push(Line::from(vec![
+            Span::styled(short_id(&row.sha), Style::new().fg(PURPLE)),
+            Span::styled(
+                format!("  {}", row.at.format("%m-%d")),
+                Style::new().fg(FAINT),
+            ),
+            Span::styled(
+                format!("  {}/{}{age}", row.surviving, row.added),
+                Style::new().fg(if row.surviving * 2 >= row.added {
+                    GREEN
+                } else {
+                    YELLOW
+                }),
+            ),
+            Span::styled(
+                format!("  {}", truncate(&row.subject, 24)),
+                Style::new().fg(FG),
+            ),
+            Span::styled(
+                row.session_id
+                    .as_deref()
+                    .map_or_else(String::new, |id| format!("  ⇠{}", short_id(id))),
+                Style::new().fg(DIM),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn heatmap_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(data) = &app.report else {
+        return vec![Line::styled("no data — press r", Style::new().fg(DIM))];
+    };
+    let mut lines = vec![Line::styled(
+        format!(
+            "{:<22} {:>5} {:>4} {:>6} {:>6}",
+            "file", "edits", "sess", "added", "alive"
+        ),
+        Style::new().fg(DIM),
+    )];
+    for row in data.heat.iter().take(15) {
+        let hot = row.edits >= 4;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<22}", truncate(&row.file, 22)),
+                Style::new().fg(if hot { YELLOW } else { FG }),
+            ),
+            Span::styled(
+                format!(" {:>5} {:>4}", row.edits, row.sessions),
+                Style::new().fg(FG),
+            ),
+            Span::styled(
+                format!(" {:>6} {:>6}", row.added, row.surviving),
+                Style::new().fg(DIM),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn session_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(data) = &app.report else {
+        return vec![Line::styled("no data — press r", Style::new().fg(DIM))];
+    };
+    let mut lines = vec![Line::styled(
+        format!(
+            "{:<9} {:<11} {:>5} {:>7} {:>7} {:>4}",
+            "session", "start", "turns", "tok", "babysit", "cmts"
+        ),
+        Style::new().fg(DIM),
+    )];
+    for row in data.sessions.iter().take(15) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<9}", short_id(&row.id)), Style::new().fg(PURPLE)),
+            Span::styled(
+                format!(
+                    " {:<11}",
+                    row.start.with_timezone(&Local).format("%m-%d %H:%M")
+                ),
+                Style::new().fg(FAINT),
+            ),
+            Span::styled(
+                format!(
+                    " {:>5} {:>7} {:>7}",
+                    row.prompts,
+                    fmt_tokens(row.output_tokens),
+                    fmt_duration(row.babysit)
+                ),
+                Style::new().fg(FG),
+            ),
+            Span::styled(
+                format!(" {:>4}", row.commits),
+                Style::new().fg(if row.commits > 0 { GREEN } else { DIM }),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn kv_line(label: &str, value: String, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<19}"), Style::new().fg(DIM)),
+        Span::styled(value, Style::new().fg(color)),
+    ])
 }
 
 fn block(title: &str, alert: bool) -> Block<'_> {

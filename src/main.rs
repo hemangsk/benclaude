@@ -2,26 +2,48 @@
 //!
 //! Runs in a narrow terminal split beside a Claude Code session, tails the
 //! session transcript read-only, and annotates the live activity with
-//! 30-day history from past transcripts of the same project.
+//! 30-day history from past transcripts of the same project. The report,
+//! heatmap, and sessions views join those transcripts with git history.
 
+mod git;
+mod report;
 mod state;
 mod transcript;
 mod ui;
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
+use report::ReportData;
 use state::{History, SessionState};
 use transcript::Tailer;
 
 const TICK: Duration = Duration::from_millis(250);
 const RESCAN_SESSIONS: Duration = Duration::from_secs(5);
 const TOAST_FOR: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Watch,
+    Doctor,
+    Report,
+    Heatmap,
+    Sessions,
+}
+
+/// Which screen the TUI is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum View {
+    Watch,
+    Report,
+    Heatmap,
+    Sessions,
+}
 
 /// Shared app state handed to the renderer.
 #[derive(Debug)]
@@ -30,43 +52,46 @@ pub(crate) struct App {
     pub(crate) session: Option<SessionState>,
     pub(crate) history: History,
     pub(crate) toast: Option<String>,
+    pub(crate) view: View,
+    pub(crate) report: Option<ReportData>,
     toast_until: Option<Instant>,
+    cwd: PathBuf,
     project_dir: PathBuf,
     tailer: Option<Tailer>,
     last_session_check: Option<Instant>,
 }
 
 fn main() -> Result<()> {
-    let cwd = parse_args()?;
+    let (command, cwd) = parse_args()?;
     let project_dir = transcript::project_dir(&cwd)?;
 
-    if std::env::args().nth(1).as_deref() == Some("doctor") {
-        return doctor(&cwd, &project_dir);
+    match command {
+        Command::Doctor => return doctor(&cwd, &project_dir),
+        Command::Report | Command::Heatmap | Command::Sessions => {
+            let history = History::scan(&project_dir, Utc::now());
+            let data = report::build(&cwd, &history)?;
+            match command {
+                Command::Report => report::print_report(&data),
+                Command::Heatmap => report::print_heatmap(&data),
+                _ => report::print_sessions(&data),
+            }
+            return Ok(());
+        }
+        Command::Watch => {}
     }
     if !std::io::stdout().is_terminal() {
         bail!("benclaude watch needs a TTY — run it inside a terminal pane");
     }
 
-    let project_name = cwd.file_name().map_or_else(
-        || cwd.display().to_string(),
-        |n| {
-            let parent = cwd
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned());
-            parent.map_or_else(
-                || n.to_string_lossy().into_owned(),
-                |p| format!("{p}/{}", n.to_string_lossy()),
-            )
-        },
-    );
-
     let mut app = App {
-        project_name,
+        project_name: project_name(&cwd),
         session: None,
         history: History::scan(&project_dir, Utc::now()),
         toast: None,
+        view: View::Watch,
+        report: None,
         toast_until: None,
+        cwd,
         project_dir,
         tailer: None,
         last_session_check: None,
@@ -78,6 +103,17 @@ fn main() -> Result<()> {
     result
 }
 
+/// `parent/dir` of the watched project, for the header.
+fn project_name(cwd: &Path) -> String {
+    let dir = cwd.file_name().map_or_else(
+        || cwd.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    cwd.parent()
+        .and_then(|p| p.file_name())
+        .map_or_else(|| dir.clone(), |p| format!("{}/{dir}", p.to_string_lossy()))
+}
+
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
         app.refresh()?;
@@ -86,15 +122,18 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(());
-                }
-                KeyCode::Char('r' | 'h' | 's') => {
-                    // ponytail: report/heatmap/sessions views land with the
-                    // git-join indexer in v0.2.
-                    app.show_toast("coming in v0.2 — needs the git indexer");
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(());
+            }
+            match (app.view, key.code) {
+                (View::Watch, KeyCode::Char('q') | KeyCode::Esc) => return Ok(()),
+                (View::Watch, KeyCode::Char('r')) => app.open(View::Report),
+                (View::Watch, KeyCode::Char('h')) => app.open(View::Heatmap),
+                (View::Watch, KeyCode::Char('s')) => app.open(View::Sessions),
+                (_, KeyCode::Char('q' | 'b') | KeyCode::Esc) => app.view = View::Watch,
+                (view, KeyCode::Char('r')) => {
+                    app.report = None;
+                    app.open(view);
                 }
                 _ => {}
             }
@@ -137,45 +176,69 @@ impl App {
         Ok(())
     }
 
+    /// Switches to an analytics view, running the git join if needed.
+    fn open(&mut self, view: View) {
+        if self.report.is_none() {
+            match report::build(&self.cwd, &self.history) {
+                Ok(data) => self.report = Some(data),
+                Err(error) => {
+                    self.show_toast(&format!("git join failed: {error:#}"));
+                    return;
+                }
+            }
+        }
+        self.view = view;
+    }
+
     fn show_toast(&mut self, message: &str) {
         self.toast = Some(message.to_owned());
         self.toast_until = Some(Instant::now() + TOAST_FOR);
     }
 }
 
-/// `benclaude [watch|doctor] [--project <path>]` — tiny by design; reach for
-/// clap when a third subcommand shows up.
-fn parse_args() -> Result<PathBuf> {
+/// Tiny by design; reach for clap when the flags stop being trivial.
+fn parse_args() -> Result<(Command, PathBuf)> {
+    let mut command = Command::Watch;
     let mut project = std::env::current_dir().context("cannot resolve cwd")?;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "watch" | "doctor" => {}
+            "watch" => command = Command::Watch,
+            "doctor" => command = Command::Doctor,
+            "report" => command = Command::Report,
+            "heatmap" => command = Command::Heatmap,
+            "sessions" => command = Command::Sessions,
             "--project" | "-p" => {
                 project = PathBuf::from(args.next().context("--project needs a path")?);
             }
             "--help" | "-h" => {
                 println!(
-                    "benclaude — live analytics side pane for Claude Code\n\n\
-                     Usage: benclaude [watch] [--project <path>]\n       \
-                     benclaude doctor [--project <path>]\n\n\
-                     watch    live TUI for the newest session (default)\n\
-                     doctor   print what benclaude can see, no TUI"
+                    "benclaude — outcome analytics side pane for Claude Code\n\n\
+                     Usage: benclaude [command] [--project <path>]\n\n\
+                     watch     live TUI for the newest session (default)\n\
+                     report    AI commits + line survival, plain text\n\
+                     heatmap   per-file agent friction, plain text\n\
+                     sessions  per-session results, plain text\n\
+                     doctor    print what benclaude can see, no TUI"
                 );
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other} (try --help)"),
         }
     }
-    Ok(project)
+    Ok((command, project))
 }
 
 /// Non-TUI sanity check: what project dir resolves to, which sessions are
 /// visible, and whether the newest one parses.
-fn doctor(cwd: &std::path::Path, project_dir: &std::path::Path) -> Result<()> {
+fn doctor(cwd: &Path, project_dir: &Path) -> Result<()> {
     println!("cwd          {}", cwd.display());
     println!("project dir  {}", project_dir.display());
     println!("exists       {}", project_dir.is_dir());
+    match git::repo_root(cwd) {
+        Some(root) => println!("git repo     {}", root.display()),
+        None => println!("git repo     none"),
+    }
     let sessions = transcript::recent_sessions(project_dir, 30);
     println!("sessions 30d {}", sessions.len());
     if let Some(latest) = transcript::latest_session(project_dir) {

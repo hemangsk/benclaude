@@ -39,7 +39,15 @@ benclaude watch --project ~/code/my-app
 benclaude doctor
 ```
 
-Keys: `q` quit · `r`/`h`/`s` reserved for the v0.2 report/heatmap/sessions views.
+Keys in `watch`: `q` quit · `r` report · `h` heatmap · `s` sessions
+(inside a view: `b`/`q` back, `r` refresh). The same views are available as
+plain-text subcommands for scripts and agents:
+
+```sh
+benclaude report     # AI commits, line survival 7d+, tokens per surviving line
+benclaude heatmap    # per-file agent friction: edits, sessions, added, alive
+benclaude sessions   # per-session turns, tokens, babysit time, linked commits
+```
 
 ## How it works
 
@@ -52,7 +60,19 @@ follow-ups per session, tokens per day, babysit time).
 
 benclaude never writes to, locks, or moves transcript files.
 
+## The git join (v0.2)
+
+Commits carrying a `Co-Authored-By: Claude` trailer are linked to the
+session whose time window contains them. `git blame` then tells which of
+their lines are still alive in `HEAD`:
+
+- **line survival 7d+** — of the lines AI commits added at least a week
+  ago, how many survive today (rewritten code = rework you paid for twice)
+- **tok/surviving line** — output tokens divided by surviving lines, the
+  honest cost metric
+- **heatmap** — transcript churn joined with git adds/survival per file;
+  hot files are your refactor backlog
+
 ## Roadmap
 
-- v0.2 — git join: link sessions to commits, line-survival rate, per-file
-  friction heatmap, `benclaude report`.
+- v0.3 — baseline vs human-only commits, task-type clustering, `--json`.
