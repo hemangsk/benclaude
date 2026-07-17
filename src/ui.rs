@@ -25,13 +25,15 @@ const BORDER_ALERT: Color = Color::Rgb(0x5c, 0x3a, 0x41);
 
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-/// Cold-to-hot ramp for the heatmap cells (background colors).
+/// Single-hue brightness ramp for the heatmap cells: dim slot marker for
+/// zero, then darker→brighter purple as intensity rises (monotonic
+/// brightness reads as intensity; mixed hues do not).
 const HEAT: [Color; 5] = [
-    Color::Rgb(0x14, 0x18, 0x21),
-    Color::Rgb(0x3a, 0x2b, 0x5e),
+    Color::Rgb(0x2a, 0x30, 0x3e),
+    Color::Rgb(0x48, 0x37, 0x72),
     Color::Rgb(0x6f, 0x4b, 0xa8),
-    Color::Rgb(0xb5, 0x8f, 0xf2),
-    Color::Rgb(0xe0, 0x6c, 0x75),
+    Color::Rgb(0x96, 0x6e, 0xd8),
+    Color::Rgb(0xc9, 0xac, 0xff),
 ];
 /// Days shown per heatmap row; each cell is two characters wide.
 const HEAT_DAYS: i64 = 14;
@@ -65,7 +67,7 @@ fn render_watch(frame: &mut Frame, app: &App) {
         Constraint::Length(5),
         Constraint::Length(6),
         Constraint::Length(5),
-        Constraint::Length(6),
+        Constraint::Length(7),
         Constraint::Length(4),
         Constraint::Length(4),
         Constraint::Min(0),
@@ -297,9 +299,9 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Files × days edit-intensity grid: each row is one hot file, each
-/// two-character cell one local day, background color scaled cold→hot
-/// against the grid's peak.
+/// Files × days edit-intensity grid: each row is one hot file, each cell one
+/// local day (block glyph + gap, so empty days still read as grid slots),
+/// brightness scaled against the grid's peak, with a time axis underneath.
 fn render_heat(frame: &mut Frame, app: &App, area: Rect) {
     let today = Local::now().date_naive();
     let hottest = app.history.hottest_files(HEAT_FILES);
@@ -325,12 +327,21 @@ fn render_heat(frame: &mut Frame, app: &App, area: Rect) {
         for days_ago in (0..HEAT_DAYS).rev() {
             let day = today - Duration::days(days_ago);
             let edits = days.and_then(|d| d.get(&day)).copied().unwrap_or(0);
-            spans.push(Span::styled("  ", Style::new().bg(heat_color(edits, peak))));
+            spans.push(Span::styled("█ ", Style::new().fg(heat_color(edits, peak))));
         }
         lines.push(Line::from(spans));
     }
     if lines.is_empty() {
         lines.push(Line::styled("no edits in 30 days", Style::new().fg(DIM)));
+    } else {
+        let axis_width = (cells * 2).saturating_sub(5);
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(label_width + 1)),
+            Span::styled(
+                format!("{:<axis_width$}today", "14d ago"),
+                Style::new().fg(FAINT),
+            ),
+        ]));
     }
     frame.render_widget(
         Paragraph::new(lines).block(block("HEATMAP · EDITS × 14D", false)),
